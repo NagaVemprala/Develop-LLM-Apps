@@ -2,3 +2,9 @@ langchain
 langchain-openai
 streamlit
 dotenv
+
+# --- RAG project (1 Project - Research RAG) ---
+chromadb
+langchain-chroma
+langchain-text-splitters
+pypdf
