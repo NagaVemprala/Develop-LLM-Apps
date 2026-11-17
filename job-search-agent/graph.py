@@ -11,6 +11,24 @@ from schemas import JobSearchRequest, JobListing, JobListingBatch
 
 # load_dotenv()  # Commented out: keys are loaded via st.secrets in ui.py
 
+DEFAULT_ATS_BOARDS = [
+    "greenhouse.io",
+    "lever.co",
+    "ashbyhq.com",
+    "myworkdayjobs.com",
+    "icims.com",
+    "smartrecruiters.com",
+    "builtin.com",
+]
+
+NOISE_DOMAINS = [
+    "youtube.com",
+    "simplilearn.com",
+    "coursera.org",
+    "udemy.com",
+    "medium.com",
+]
+
 class AgentState(TypedDict):
     criteria: JobSearchRequest
     search_query: str
@@ -28,14 +46,18 @@ def search_tavily(state: AgentState) -> dict:
     c = state["criteria"]
     kw = " ".join(c.keywords)
     exp = c.experience_level or ""
-    query = f"{exp} {c.role} {c.location} {kw}".strip()
+    # Adding "apply" steers Tavily toward live postings rather than career advice articles
+    query = f"{exp} {c.role} {c.location} {kw} job apply".strip()
 
-    # TavilySearch reads TAVILY_API_KEY from os.environ (populated by st.secrets in ui.py)
+    # Use explicit target_boards if provided; otherwise fall back to DEFAULT_ATS_BOARDS
+    domains_to_include = c.target_boards if c.target_boards else DEFAULT_ATS_BOARDS
+
     tavily_tool = TavilySearch(
-        max_results=8,
+        max_results=10,
         topic="general",
         search_depth="advanced",
-        include_domains=c.target_boards if c.target_boards else None,
+        include_domains=domains_to_include,
+        exclude_domains=NOISE_DOMAINS,
     )
     response = tavily_tool.invoke({"query": query})
     return {
@@ -46,8 +68,15 @@ def search_tavily(state: AgentState) -> dict:
 
 def extract_jobs(state: AgentState) -> dict:
     prompt = (
-        "Extract specific, active job postings from the Tavily results below.\n"
-        "- Exclude generic search index pages or blog articles.\n"
+        "Extract specific, active job postings from the Tavily search results below.\n"
+        "Rules:\n"
+        "1. Extract every real job opening mentioned—even if multiple jobs are listed inside a "
+        "job-board search page snippet (such as Built In, SimplyHired, or ZipRecruiter).\n"
+        "2. For each job, extract the job title, company name (use 'Unknown / Listed on Board' "
+        "if not explicitly named), location, the result's URL, and a concise summary.\n"
+        "3. Ignore pure career-advice articles, YouTube videos, and social media posts.\n"
+        "4. Be flexible with keywords and seniority: include closely matching roles (e.g., Entry Level, "
+        "Junior, Associate, or Analyst II) even if not every keyword appears in the short snippet.\n\n"
         f"Target Criteria: {state['criteria'].model_dump_json()}\n\n"
         f"Tavily Results:\n{state['raw_results']}"
     )
