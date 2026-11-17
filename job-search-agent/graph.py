@@ -47,6 +47,8 @@ class _RawJob(BaseModel):
     location: str
     url: str
     summary: str
+    match_score: int = Field(default=5, ge=1, le=10)
+    matched_keywords: list[str] = Field(default_factory=list)
 
 
 class _RawJobBatch(BaseModel):
@@ -91,22 +93,40 @@ def search_tavily(state: AgentState) -> dict:
 
 
 def extract_jobs(state: AgentState) -> dict:
+    raw_payload = json.loads(state["raw_results"])
+    candidate_results = [
+        {
+            "url": r.get("url"),
+            "title": r.get("title"),
+            "content": (r.get("content") or "")[:2500],
+        }
+        for r in raw_payload.get("results", [])
+        if is_specific_job_url(r.get("url", ""))
+    ]
+
+    if not candidate_results:
+        return {"structured_jobs": []}
+
     prompt = (
-        "Extract ONLY specific, single-role job postings from the Tavily search results below.\n"
-        "Strict Rules:\n"
-        "1. ONLY include results whose URL points directly to a single job application/description page "
-        "(e.g., boards.greenhouse.io/company/jobs/123, jobs.lever.co/company/uuid, "
-        "jobs.ashbyhq.com/company/uuid, linkedin.com/jobs/view/123, or a specific company career req URL).\n"
-        "2. DO NOT extract jobs from generic search results or category listing URLs "
-        "(e.g., linkedin.com/jobs/remote-..., builtin.com/jobs/remote/..., simplyhired.com/search?...). "
-        "Never attach a search-index URL to a job listing.\n"
-        "3. Ignore blog posts, career advice articles, and videos.\n\n"
-        f"Target Criteria: {state['criteria'].model_dump_json()}\n\n"
-        f"Tavily Results:\n{state['raw_results']}"
+        "You are parsing pre-filtered job posting pages returned by a web search.\n"
+        "Extract ONE job listing object for EACH result below that represents a real job opening.\n\n"
+        "Extraction & Scoring Guidelines:\n"
+        "1. Do NOT filter out partial matches—extract all valid job postings so the human reviewer can decide.\n"
+        "2. Ignore any 'Similar jobs' sidebar links inside a snippet; extract ONLY the primary job "
+        "described by that result's `title` and `url`.\n"
+        "3. Copy the exact `url` from the result item without modifying it.\n"
+        "4. Assign a `match_score` from 1 to 10 based on how well the role title, seniority, work mode/location, "
+        "and required skills match the User Search Context (9-10 = strong match across role, level, location, and "
+        "keywords; 6-8 = solid match with minor gaps; 1-5 = adjacent role or seniority mismatch).\n"
+        "5. Populate `matched_keywords` with the exact keywords from the user's criteria (or direct equivalents) "
+        "that appear in the job's title or snippet.\n\n"
+        f"User Search Context: {state['criteria'].model_dump_json()}\n\n"
+        f"Candidate Job Pages ({len(candidate_results)} items):\n"
+        f"{json.dumps(candidate_results, indent=2)}"
     )
+
     raw_batch: _RawJobBatch = structured_llm.invoke(prompt)
 
-    # Programmatically enforce direct-job URL filtering and deduplicate by URL
     seen_urls: set[str] = set()
     valid_jobs: list[JobListing] = []
     for item in raw_batch.jobs:
@@ -114,6 +134,8 @@ def extract_jobs(state: AgentState) -> dict:
             seen_urls.add(item.url)
             valid_jobs.append(JobListing(**item.model_dump()))
 
+    # Sort highest match_score first
+    valid_jobs.sort(key=lambda j: j.match_score, reverse=True)
     return {"structured_jobs": valid_jobs}
 
 def human_review(

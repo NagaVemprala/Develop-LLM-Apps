@@ -58,6 +58,16 @@ class JobListing(BaseModel):
     location: str
     url: str
     summary: str
+    match_score: int = Field(
+        default=5,
+        ge=1,
+        le=10,
+        description="1-10 alignment score against the user's role, location, experience level, and keywords.",
+    )
+    matched_keywords: list[str] = Field(
+        default_factory=list,
+        description="Subset of user keywords (and closely related skills) explicitly found in the job snippet.",
+    )
 
     @field_validator("url")
     @classmethod

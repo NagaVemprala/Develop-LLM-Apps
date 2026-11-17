@@ -5,11 +5,7 @@ from langgraph.types import Command
 from langchain_core.tracers.context import collect_runs
 from langsmith import Client as LangSmithClient
 
-from schemas import JobSearchRequest  # noqa: E402
-from graph import job_search_graph  # noqa: E402
-
-# Reads from .streamlit/secrets.toml locally or App Secrets on Streamlit Cloud
-# --- Load API keys & LangSmith config from Streamlit Secrets BEFORE importing graph.py ---
+# --- 1. Load API keys & LangSmith config BEFORE importing graph.py ---
 SECRET_KEYS = [
     "OPENAI_API_KEY",
     "TAVILY_API_KEY",
@@ -25,6 +21,28 @@ for key in SECRET_KEYS:
             if isinstance(st.secrets[key], bool)
             else str(st.secrets[key])
         )
+
+from schemas import JobSearchRequest  # noqa: E402
+from graph import job_search_graph  # noqa: E402
+
+
+def render_job_badges(job: dict) -> None:
+    """Renders a color-coded match score badge alongside matched keyword badges."""
+    score = job.get("match_score", 5)
+    if score >= 8:
+        score_badge = f":green-badge[:material/verified: Match: {score}/10]"
+    elif score >= 5:
+        score_badge = f":orange-badge[:material/trending_up: Match: {score}/10]"
+    else:
+        score_badge = f":red-badge[:material/info: Match: {score}/10]"
+
+    keywords = job.get("matched_keywords") or []
+    kw_badges = " ".join(f":blue-badge[{kw}]" for kw in keywords)
+    if not kw_badges:
+        kw_badges = ":gray-badge[No direct keyword match in snippet]"
+
+    st.markdown(f"{score_badge} {kw_badges}")
+
 
 def invoke_with_trace(graph_input, config: dict) -> tuple[dict, str | None]:
     """Executes the graph and captures the exact LangSmith trace URL."""
@@ -43,6 +61,7 @@ def invoke_with_trace(graph_input, config: dict) -> tuple[dict, str | None]:
 
     return result, trace_url
 
+
 st.set_page_config(page_title="HITL Job Search Agent", layout="centered")
 st.title("Job Search Agent (Human-in-the-Loop)")
 
@@ -52,7 +71,7 @@ defaults = {
     "extracted_jobs": [],
     "search_query": "",
     "attempt": 1,
-    "keywords_str": "Python, LangGraph, FastAPI",
+    "keywords_str": "aws, sql, excel",
     "location_str": "Remote",
     "final_result": None,
     "trace_urls": [],
@@ -101,17 +120,21 @@ if submitted:
         "raw_results": "",
         "structured_jobs": [],
         "approved_jobs": [],
+        "enriched_jobs": [],
         "action_summary": "",
         "attempt": 0,
     }
 
-    with st.spinner("Searching Online using Tavily and extracting roles..."):
-        result = job_search_graph.invoke(initial_state, config=config)
+    with st.spinner("Searching online using Tavily and extracting roles..."):
+        result, trace_url = invoke_with_trace(initial_state, config=config)
 
     st.session_state.thread_id = thread_id
     st.session_state.extracted_jobs = [j.model_dump() for j in result.get("structured_jobs", [])]
     st.session_state.search_query = result.get("search_query", "")
     st.session_state.attempt = result.get("attempt", 1)
+    if trace_url:
+        st.session_state.trace_urls.append(("Attempt #1 — Search & Extract", trace_url))
+    st.rerun()
 
 # --- Step 2: Human Review (Approve OR Reject & Re-Run) ---
 if st.session_state.thread_id and not st.session_state.final_result:
@@ -139,14 +162,15 @@ if st.session_state.thread_id and not st.session_state.final_result:
                     f"**{job['title']}** — {job['company']} ({job['location']})",
                     key=f"job_{st.session_state.thread_id}_{st.session_state.attempt}_{idx}",
                 )
+                render_job_badges(job)
                 st.write(job["summary"])
                 st.markdown(f"[View Posting]({job['url']})")
                 if checked:
                     approved_indices.append(idx)
 
-        if st.button("Approve Selected & Complete", type="primary"):
+        if st.button("Approve Selected & Extract Full Requirements", type="primary"):
             config = {"configurable": {"thread_id": st.session_state.thread_id}}
-            with st.spinner("Finalizing approved roles..."):
+            with st.spinner("Scraping full job postings via TavilyExtract..."):
                 final_state, trace_url = invoke_with_trace(
                     Command(
                         resume={
@@ -157,10 +181,11 @@ if st.session_state.thread_id and not st.session_state.final_result:
                     config=config,
                 )
             if trace_url:
-                st.session_state.trace_urls.append(("Resume — Finalize Approved", trace_url))
+                st.session_state.trace_urls.append(("Resume — TavilyExtract Details", trace_url))
             st.session_state.final_result = {
                 "action_summary": final_state.get("action_summary", ""),
                 "approved_jobs": [j.model_dump() for j in final_state.get("approved_jobs", [])],
+                "enriched_jobs": [e.model_dump() for e in final_state.get("enriched_jobs", [])],
             }
             st.rerun()
 
@@ -177,7 +202,7 @@ if st.session_state.thread_id and not st.session_state.final_result:
             key=f"loc_edit_{st.session_state.attempt}",
         )
         keep_boards = st.checkbox(
-            "Restrict to ATS boards (Greenhouse, Lever, Ashby, LinkedIn, Indeed)",
+            "Restrict to ATS boards (Greenhouse, Lever, Ashby, Workday, LinkedIn)",
             value=True,
             key=f"boards_{st.session_state.attempt}",
         )
@@ -210,15 +235,61 @@ if st.session_state.thread_id and not st.session_state.final_result:
                 st.session_state.trace_urls.append((f"Attempt #{next_attempt} — Retry Search", trace_url))
             st.rerun()
 
-# --- Step 3: Final Workflow Output ---
+# --- Step 3: Full Extracted Job Requirements ---
 if st.session_state.final_result:
     st.divider()
     done_col, done_btn_col = st.columns([3, 1])
-    done_col.subheader("3. Workflow Completed")
+    done_col.subheader("3. Full Job Requirements")
     if st.session_state.trace_urls:
         _, final_url = st.session_state.trace_urls[-1]
         done_btn_col.link_button("View Trace in LangSmith", final_url)
 
     st.success(st.session_state.final_result["action_summary"])
-    for job in st.session_state.final_result["approved_jobs"]:
-        st.markdown(f"- **{job['title']}** at **{job['company']}** ([Link]({job['url']}))")
+
+    approved_jobs = st.session_state.final_result["approved_jobs"]
+    enriched_by_url = {
+        item["url"]: item for item in st.session_state.final_result.get("enriched_jobs", [])
+    }
+
+    for idx, job in enumerate(approved_jobs):
+        details = enriched_by_url.get(job["url"], {})
+        with st.expander(
+            f"{job['title']} — {job['company']} ({job['location']})",
+            expanded=(idx == 0),
+        ):
+            render_job_badges(job)
+            st.markdown(f"**Direct Posting:** [{job['url']}]({job['url']})")
+
+            if details.get("compensation_and_benefits"):
+                st.info(f"**Compensation & Benefits:** {details['compensation_and_benefits']}")
+
+            req_col, pref_col = st.columns(2)
+            with req_col:
+                st.markdown("#### Required Qualifications")
+                reqs = details.get("required_qualifications", [])
+                if reqs:
+                    for item in reqs:
+                        st.markdown(f"- {item}")
+                else:
+                    st.caption("Not explicitly listed on extracted page.")
+
+            with pref_col:
+                st.markdown("#### Preferred Qualifications")
+                prefs = details.get("preferred_qualifications", [])
+                if prefs:
+                    for item in prefs:
+                        st.markdown(f"- {item}")
+                else:
+                    st.caption("None specified.")
+
+            st.markdown("#### Key Responsibilities")
+            resps = details.get("key_responsibilities", [])
+            if resps:
+                for item in resps:
+                    st.markdown(f"- {item}")
+            else:
+                st.write(job["summary"])
+
+            if details.get("full_description_markdown"):
+                with st.popover("View Full Extracted Description"):
+                    st.markdown(details["full_description_markdown"])
