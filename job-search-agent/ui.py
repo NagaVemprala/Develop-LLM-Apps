@@ -46,26 +46,27 @@ def invoke_with_trace(graph_input, config: dict) -> tuple[dict, str | None]:
 st.set_page_config(page_title="HITL Job Search Agent", layout="centered")
 st.title("Job Search Agent (Human-in-the-Loop)")
 
-# Initialize session state
+# Initialize session state safely (survives live code reloads)
 defaults = {
     "thread_id": None,
     "extracted_jobs": [],
     "search_query": "",
     "attempt": 1,
-    "keywords_str": "Excel, Access, SQL, Cloud, AWS",
+    "keywords_str": "Python, LangGraph, FastAPI",
     "location_str": "Remote",
     "final_result": None,
+    "trace_urls": [],
 }
 for k, v in defaults.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+    st.session_state.setdefault(k, v)
 
 # --- Sidebar: LangSmith Trace History for Current Thread ---
 with st.sidebar:
     st.header("Observability")
-    if st.session_state.trace_urls:
+    trace_urls = st.session_state.get("trace_urls", [])
+    if trace_urls:
         st.caption("LangSmith Traces (Current Thread)")
-        for label, url in st.session_state.trace_urls:
+        for label, url in trace_urls:
             st.link_button(f"🔍 {label}", url, use_container_width=True)
     else:
         st.info("Run a search to generate a LangSmith trace link.")
