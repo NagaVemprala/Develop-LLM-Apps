@@ -7,18 +7,25 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command, interrupt
 
-from schemas import JobSearchRequest, JobListing, JobListingBatch
+from schemas import (
+    JobSearchRequest,
+    JobListing,
+    EnrichedJobDetails,
+    EnrichedJobBatch,
+    is_specific_job_url,
+)
 
 # load_dotenv()  # Commented out: keys are loaded via st.secrets in ui.py
 
 DEFAULT_ATS_BOARDS = [
-    "greenhouse.io",
-    "lever.co",
-    "ashbyhq.com",
+    "boards.greenhouse.io",
+    "job-boards.greenhouse.io",
+    "jobs.lever.co",
+    "jobs.ashbyhq.com",
     "myworkdayjobs.com",
     "icims.com",
-    "smartrecruiters.com",
-    "builtin.com",
+    "jobs.smartrecruiters.com",
+    "linkedin.com/jobs/view",
 ]
 
 NOISE_DOMAINS = [
@@ -27,7 +34,23 @@ NOISE_DOMAINS = [
     "coursera.org",
     "udemy.com",
     "medium.com",
+    "simplyhired.com",
+    "ziprecruiter.com",
 ]
+
+
+# Intermediate unvalidated batch so one generic URL doesn't discard valid jobs in the same batch
+class _RawJob(BaseModel):
+    title: str
+    company: str
+    location: str
+    url: str
+    summary: str
+
+
+class _RawJobBatch(BaseModel):
+    jobs: list[_RawJob] = Field(default_factory=list)
+
 
 class AgentState(TypedDict):
     criteria: JobSearchRequest
@@ -35,25 +58,24 @@ class AgentState(TypedDict):
     raw_results: str
     structured_jobs: list[JobListing]
     approved_jobs: list[JobListing]
+    enriched_jobs: list[EnrichedJobDetails]
     action_summary: str
     attempt: int
 
-
 llm = ChatOpenAI(model="gpt-6-luna")
-structured_llm = llm.with_structured_output(JobListingBatch)
+structured_llm = llm.with_structured_output(_RawJobBatch)
+enrichment_llm = llm.with_structured_output(EnrichedJobBatch)
 
 def search_tavily(state: AgentState) -> dict:
     c = state["criteria"]
     kw = " ".join(c.keywords)
     exp = c.experience_level or ""
-    # Adding "apply" steers Tavily toward live postings rather than career advice articles
-    query = f"{exp} {c.role} {c.location} {kw} job apply".strip()
+    query = f"{exp} {c.role} {c.location} {kw} apply".strip()
 
-    # Use explicit target_boards if provided; otherwise fall back to DEFAULT_ATS_BOARDS
     domains_to_include = c.target_boards if c.target_boards else DEFAULT_ATS_BOARDS
 
     tavily_tool = TavilySearch(
-        max_results=10,
+        max_results=12,
         topic="general",
         search_depth="advanced",
         include_domains=domains_to_include,
@@ -66,22 +88,32 @@ def search_tavily(state: AgentState) -> dict:
         "attempt": state.get("attempt", 0) + 1,
     }
 
+
 def extract_jobs(state: AgentState) -> dict:
     prompt = (
-        "Extract specific, active job postings from the Tavily search results below.\n"
-        "Rules:\n"
-        "1. Extract every real job opening mentioned—even if multiple jobs are listed inside a "
-        "job-board search page snippet (such as Built In, SimplyHired, or ZipRecruiter).\n"
-        "2. For each job, extract the job title, company name (use 'Unknown / Listed on Board' "
-        "if not explicitly named), location, the result's URL, and a concise summary.\n"
-        "3. Ignore pure career-advice articles, YouTube videos, and social media posts.\n"
-        "4. Be flexible with keywords and seniority: include closely matching roles (e.g., Entry Level, "
-        "Junior, Associate, or Analyst II) even if not every keyword appears in the short snippet.\n\n"
+        "Extract ONLY specific, single-role job postings from the Tavily search results below.\n"
+        "Strict Rules:\n"
+        "1. ONLY include results whose URL points directly to a single job application/description page "
+        "(e.g., boards.greenhouse.io/company/jobs/123, jobs.lever.co/company/uuid, "
+        "jobs.ashbyhq.com/company/uuid, linkedin.com/jobs/view/123, or a specific company career req URL).\n"
+        "2. DO NOT extract jobs from generic search results or category listing URLs "
+        "(e.g., linkedin.com/jobs/remote-..., builtin.com/jobs/remote/..., simplyhired.com/search?...). "
+        "Never attach a search-index URL to a job listing.\n"
+        "3. Ignore blog posts, career advice articles, and videos.\n\n"
         f"Target Criteria: {state['criteria'].model_dump_json()}\n\n"
         f"Tavily Results:\n{state['raw_results']}"
     )
-    batch: JobListingBatch = structured_llm.invoke(prompt)
-    return {"structured_jobs": batch.jobs}
+    raw_batch: _RawJobBatch = structured_llm.invoke(prompt)
+
+    # Programmatically enforce direct-job URL filtering and deduplicate by URL
+    seen_urls: set[str] = set()
+    valid_jobs: list[JobListing] = []
+    for item in raw_batch.jobs:
+        if item.url not in seen_urls and is_specific_job_url(item.url):
+            seen_urls.add(item.url)
+            valid_jobs.append(JobListing(**item.model_dump()))
+
+    return {"structured_jobs": valid_jobs}
 
 def human_review(
     state: AgentState,

@@ -1,51 +1,88 @@
-from pydantic import BaseModel, Field
+import re
+from urllib.parse import urlparse
+from pydantic import BaseModel, Field, field_validator
+
+# Patterns that indicate a generic search/index page rather than a single job posting
+GENERIC_SEARCH_URL_PATTERNS = [
+    r"/jobs/search",
+    r"/jobs/remote-",
+    r"/jobs/[^/]+-jobs/?$",
+    r"/search\?",
+    r"/Jobs/",
+    r"builtin\.com/jobs/remote",
+    r"builtinaustin\.com/jobs/remote",
+    r"builtinchicago\.org/jobs/remote",
+    r"simplyhired\.com/search",
+    r"ziprecruiter\.com/Jobs/",
+    r"indeed\.com/q-",
+    r"indeed\.com/jobs\?",
+    r"linkedin\.com/jobs/[^v]",  # Allows /jobs/view/... while blocking /jobs/remote-...
+]
+
+def is_specific_job_url(url: str) -> bool:
+    """Returns True only if the URL points to an individual job posting."""
+    if not url or not url.startswith(("http://", "https://")):
+        return False
+    parsed = urlparse(url)
+    # Reject bare homepages
+    if parsed.path in ("", "/"):
+        return False
+    for pattern in GENERIC_SEARCH_URL_PATTERNS:
+        if re.search(pattern, url, re.IGNORECASE):
+            return False
+    return True
+
 
 class JobSearchRequest(BaseModel):
     role: str = Field(..., example="AI Engineer")
-    location: str = Field(default="Remote", example="In-person")
+    location: str = Field(default="Remote", example="Remote")
     experience_level: str | None = Field(default=None, example="Senior")
     keywords: list[str] = Field(default_factory=list, example=["Python", "LangGraph", "FastAPI"])
     target_boards: list[str] = Field(
         default_factory=lambda: [
-            "greenhouse.io",
-            "lever.co",
-            "ashbyhq.com",
-            "linkedin.com/jobs",
-            "indeed.com",
+            "boards.greenhouse.io",
+            "job-boards.greenhouse.io",
+            "jobs.lever.co",
+            "jobs.ashbyhq.com",
+            "myworkdayjobs.com",
+            "icims.com",
+            "jobs.smartrecruiters.com",
+            "linkedin.com/jobs/view",
         ],
-        description="Domains to prioritize in Tavily search. Pass [] to search the entire web.",
     )
 
+
 class JobListing(BaseModel):
-    title: str = Field(..., description="Exact job title")
-    company: str = Field(..., description="Hiring company name")
-    location: str = Field(..., description="Job location or Remote status")
-    url: str = Field(..., description="Direct application or posting URL")
-    summary: str = Field(..., description="1-2 sentence summary of key responsibilities and stack")
+    title: str
+    company: str
+    location: str
+    url: str
+    summary: str
+
+    @field_validator("url")
+    @classmethod
+    def validate_direct_job_url(cls, v: str) -> str:
+        if not is_specific_job_url(v):
+            raise ValueError(f"Generic search or non-specific job URL rejected: {v}")
+        return v
+
 
 class JobListingBatch(BaseModel):
     jobs: list[JobListing] = Field(default_factory=list)
 
-class JobSearchResponse(BaseModel):
-    query_used: str
-    total_found: int
-    results: list[JobListing]
 
-class StartSearchResponse(BaseModel):
-    thread_id: str
-    status: str  # "awaiting_approval" or "completed"
-    extracted_jobs: list[JobListing]
-
-class ResumeSearchRequest(BaseModel):
-    thread_id: str
-    approved_indices: list[int] = Field(
-        ...,
-        example=[0, 2],
-        description="0-based indices of the jobs you want to approve for next steps.",
+class EnrichedJobDetails(BaseModel):
+    url: str
+    key_responsibilities: list[str] = Field(default_factory=list)
+    required_qualifications: list[str] = Field(default_factory=list)
+    preferred_qualifications: list[str] = Field(default_factory=list)
+    compensation_and_benefits: str | None = Field(
+        default=None, description="Salary range, equity, or benefits if listed on the page"
+    )
+    full_description_markdown: str = Field(
+        default="", description="Clean summary or extracted text of the full posting"
     )
 
-class FinalSearchResponse(BaseModel):
-    thread_id: str
-    status: str
-    approved_jobs: list[JobListing]
-    action_summary: str
+
+class EnrichedJobBatch(BaseModel):
+    enriched_jobs: list[EnrichedJobDetails] = Field(default_factory=list)
