@@ -2,14 +2,46 @@ import os
 import uuid
 import streamlit as st
 from langgraph.types import Command
-
-# --- Load API keys from Streamlit Secrets BEFORE importing graph.py ---
-# Reads from .streamlit/secrets.toml locally or App Secrets on Streamlit Cloud
-os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
-os.environ["TAVILY_API_KEY"] = st.secrets["TAVILY_API_KEY"]
+from langchain_core.tracers.context import collect_runs
+from langsmith import Client as LangSmithClient
 
 from schemas import JobSearchRequest  # noqa: E402
 from graph import job_search_graph  # noqa: E402
+
+# Reads from .streamlit/secrets.toml locally or App Secrets on Streamlit Cloud
+# --- Load API keys & LangSmith config from Streamlit Secrets BEFORE importing graph.py ---
+SECRET_KEYS = [
+    "OPENAI_API_KEY",
+    "TAVILY_API_KEY",
+    "LANGSMITH_API_KEY",
+    "LANGSMITH_TRACING_V2",
+    "LANGSMITH_PROJECT",
+    "LANGSMITH_ENDPOINT",
+]
+for key in SECRET_KEYS:
+    if key in st.secrets:
+        os.environ[key] = (
+            str(st.secrets[key]).lower()
+            if isinstance(st.secrets[key], bool)
+            else str(st.secrets[key])
+        )
+
+def invoke_with_trace(graph_input, config: dict) -> tuple[dict, str | None]:
+    """Executes the graph and captures the exact LangSmith trace URL."""
+    with collect_runs() as cb:
+        result = job_search_graph.invoke(graph_input, config=config)
+
+    trace_url = None
+    if cb.traced_runs:
+        run_id = cb.traced_runs[0].id
+        try:
+            ls_client = LangSmithClient()
+            trace_url = ls_client.read_run(run_id).url
+        except Exception:
+            project = os.environ.get("LANGSMITH_PROJECT", "default")
+            trace_url = f"https://smith.langchain.com/o/default/projects/p/{project}/r/{run_id}"
+
+    return result, trace_url
 
 st.set_page_config(page_title="HITL Job Search Agent", layout="centered")
 st.title("Job Search Agent (Human-in-the-Loop)")
@@ -20,7 +52,7 @@ defaults = {
     "extracted_jobs": [],
     "search_query": "",
     "attempt": 1,
-    "keywords_str": "Python, LangGraph, FastAPI",
+    "keywords_str": "Excel, Access, SQL, Cloud, AWS",
     "location_str": "Remote",
     "final_result": None,
 }
@@ -28,17 +60,28 @@ for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
+# --- Sidebar: LangSmith Trace History for Current Thread ---
+with st.sidebar:
+    st.header("Observability")
+    if st.session_state.trace_urls:
+        st.caption("LangSmith Traces (Current Thread)")
+        for label, url in st.session_state.trace_urls:
+            st.link_button(f"🔍 {label}", url, use_container_width=True)
+    else:
+        st.info("Run a search to generate a LangSmith trace link.")
+
 # --- Step 1: Initial Search Criteria ---
 with st.form("search_form"):
     col1, col2 = st.columns(2)
-    role = col1.text_input("Role", value="AI Engineer")
+    role = col1.text_input("Role", value="Business Analyst")
     location = col2.text_input("Location", value=st.session_state.location_str)
-    experience = col1.text_input("Experience Level", value="Senior")
+    experience = col1.text_input("Experience Level", value="Entry Level")
     keywords_raw = col2.text_input("Keywords (comma-separated)", value=st.session_state.keywords_str)
     submitted = st.form_submit_button("1. Start New Search")
 
 if submitted:
     st.session_state.final_result = None
+    st.session_state.trace_urls = []
     st.session_state.keywords_str = keywords_raw
     st.session_state.location_str = location
 
@@ -61,7 +104,7 @@ if submitted:
         "attempt": 0,
     }
 
-    with st.spinner("Searching Tavily and extracting roles..."):
+    with st.spinner("Searching Online using Tavily and extracting roles..."):
         result = job_search_graph.invoke(initial_state, config=config)
 
     st.session_state.thread_id = thread_id
@@ -72,7 +115,13 @@ if submitted:
 # --- Step 2: Human Review (Approve OR Reject & Re-Run) ---
 if st.session_state.thread_id and not st.session_state.final_result:
     st.divider()
-    st.subheader(f"2. Human Review (Attempt #{st.session_state.attempt})")
+
+    header_col, btn_col = st.columns([3, 1])
+    header_col.subheader(f"2. Human Review (Attempt #{st.session_state.attempt})")
+    if st.session_state.trace_urls:
+        _, latest_url = st.session_state.trace_urls[-1]
+        btn_col.link_button("View Trace in LangSmith", latest_url)
+
     st.caption(
         f"Thread: `{st.session_state.thread_id}` | Query used: `{st.session_state.search_query}`"
     )
@@ -97,7 +146,7 @@ if st.session_state.thread_id and not st.session_state.final_result:
         if st.button("Approve Selected & Complete", type="primary"):
             config = {"configurable": {"thread_id": st.session_state.thread_id}}
             with st.spinner("Finalizing approved roles..."):
-                final_state = job_search_graph.invoke(
+                final_state, trace_url = invoke_with_trace(
                     Command(
                         resume={
                             "decision": "approve",
@@ -106,6 +155,8 @@ if st.session_state.thread_id and not st.session_state.final_result:
                     ),
                     config=config,
                 )
+            if trace_url:
+                st.session_state.trace_urls.append(("Resume — Finalize Approved", trace_url))
             st.session_state.final_result = {
                 "action_summary": final_state.get("action_summary", ""),
                 "approved_jobs": [j.model_dump() for j in final_state.get("approved_jobs", [])],
@@ -136,7 +187,7 @@ if st.session_state.thread_id and not st.session_state.final_result:
             config = {"configurable": {"thread_id": st.session_state.thread_id}}
 
             with st.spinner("Looping back to Tavily with updated criteria..."):
-                updated_state = job_search_graph.invoke(
+                updated_state, trace_url = invoke_with_trace(
                     Command(
                         resume={
                             "decision": "reject",
@@ -148,17 +199,25 @@ if st.session_state.thread_id and not st.session_state.final_result:
                     config=config,
                 )
 
+            next_attempt = updated_state.get("attempt", st.session_state.attempt + 1)
             st.session_state.extracted_jobs = [
                 j.model_dump() for j in updated_state.get("structured_jobs", [])
             ]
             st.session_state.search_query = updated_state.get("search_query", "")
-            st.session_state.attempt = updated_state.get("attempt", st.session_state.attempt + 1)
+            st.session_state.attempt = next_attempt
+            if trace_url:
+                st.session_state.trace_urls.append((f"Attempt #{next_attempt} — Retry Search", trace_url))
             st.rerun()
 
 # --- Step 3: Final Workflow Output ---
 if st.session_state.final_result:
     st.divider()
-    st.subheader("3. Workflow Completed")
+    done_col, done_btn_col = st.columns([3, 1])
+    done_col.subheader("3. Workflow Completed")
+    if st.session_state.trace_urls:
+        _, final_url = st.session_state.trace_urls[-1]
+        done_btn_col.link_button("View Trace in LangSmith", final_url)
+
     st.success(st.session_state.final_result["action_summary"])
     for job in st.session_state.final_result["approved_jobs"]:
         st.markdown(f"- **{job['title']}** at **{job['company']}** ([Link]({job['url']}))")
