@@ -2,7 +2,6 @@ import re
 from urllib.parse import urlparse
 from pydantic import BaseModel, Field, field_validator
 
-# Patterns that indicate a generic search/index page rather than a single job posting
 GENERIC_SEARCH_URL_PATTERNS = [
     r"/jobs/search",
     r"/jobs/remote-",
@@ -19,12 +18,12 @@ GENERIC_SEARCH_URL_PATTERNS = [
     r"linkedin\.com/jobs/[^v]",  # Allows /jobs/view/... while blocking /jobs/remote-...
 ]
 
+
 def is_specific_job_url(url: str) -> bool:
     """Returns True only if the URL points to an individual job posting."""
     if not url or not url.startswith(("http://", "https://")):
         return False
     parsed = urlparse(url)
-    # Reject bare homepages
     if parsed.path in ("", "/"):
         return False
     for pattern in GENERIC_SEARCH_URL_PATTERNS:
@@ -34,10 +33,10 @@ def is_specific_job_url(url: str) -> bool:
 
 
 class JobSearchRequest(BaseModel):
-    role: str = Field(..., example="AI Engineer")
+    role: str = Field(..., example="Business Analyst")
     location: str = Field(default="Remote", example="Remote")
-    experience_level: str | None = Field(default=None, example="Senior")
-    keywords: list[str] = Field(default_factory=list, example=["Python", "LangGraph", "FastAPI"])
+    experience_level: str | None = Field(default=None, example="Entry Level")
+    keywords: list[str] = Field(default_factory=list, example=["aws", "sql", "excel"])
     target_boards: list[str] = Field(
         default_factory=lambda: [
             "boards.greenhouse.io",
@@ -58,16 +57,12 @@ class JobListing(BaseModel):
     location: str
     url: str
     summary: str
-    match_score: int = Field(
-        default=5,
-        ge=1,
-        le=10,
-        description="1-10 alignment score against the user's role, location, experience level, and keywords.",
+    source_type: str = Field(
+        default="ATS",
+        description="'ATS' for direct applicant tracking systems, 'LinkedIn' for LinkedIn postings.",
     )
-    matched_keywords: list[str] = Field(
-        default_factory=list,
-        description="Subset of user keywords (and closely related skills) explicitly found in the job snippet.",
-    )
+    match_score: int = Field(default=5, ge=1, le=10)
+    matched_keywords: list[str] = Field(default_factory=list)
 
     @field_validator("url")
     @classmethod
@@ -86,12 +81,8 @@ class EnrichedJobDetails(BaseModel):
     key_responsibilities: list[str] = Field(default_factory=list)
     required_qualifications: list[str] = Field(default_factory=list)
     preferred_qualifications: list[str] = Field(default_factory=list)
-    compensation_and_benefits: str | None = Field(
-        default=None, description="Salary range, equity, or benefits if listed on the page"
-    )
-    full_description_markdown: str = Field(
-        default="", description="Clean summary or extracted text of the full posting"
-    )
+    compensation_and_benefits: str | None = Field(default=None)
+    full_description_markdown: str = Field(default="")
 
 
 class EnrichedJobBatch(BaseModel):
